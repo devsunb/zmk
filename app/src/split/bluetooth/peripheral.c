@@ -33,6 +33,16 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+/* Adaptive advertising intervals for multi-dongle support
+ * Fast advertising (20ms) for quick connection, then slow (200ms) to save battery
+ * Interval unit: 0.625ms, so 20ms = 32 units, 200ms = 320 units
+ */
+#define ADV_FAST_INTERVAL_MIN 0x0020  /* 20ms */
+#define ADV_FAST_INTERVAL_MAX 0x0020  /* 20ms */
+#define ADV_SLOW_INTERVAL_MIN 0x0140  /* 200ms */
+#define ADV_SLOW_INTERVAL_MAX 0x0140  /* 200ms */
+#define ADV_FAST_DURATION_SEC 5       /* Fast advertising duration */
+
 #include <zmk/event_manager.h>
 #include <zmk/events/split_peripheral_status_changed.h>
 #include <zmk/ble.h>
@@ -48,35 +58,45 @@ static bool is_connected = false;
 
 static bool is_bonded = false;
 
-static void each_bond(const struct bt_bond_info *info, void *user_data) {
-    bt_addr_le_t *addr = (bt_addr_le_t *)user_data;
+static bool slow_advertising = false;
 
-    if (bt_addr_le_cmp(&info->addr, BT_ADDR_LE_NONE) != 0) {
-        bt_addr_le_copy(addr, &info->addr);
-    }
+static void switch_to_slow_adv_cb(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(slow_adv_work, switch_to_slow_adv_cb);
+
+static void count_bonds(const struct bt_bond_info *info, void *user_data) {
+    int *count = (int *)user_data;
+    (*count)++;
 }
 
-static int start_advertising(bool low_duty) {
-    bt_addr_le_t central_addr = bt_addr_le_none;
+/* Always use undirected advertising for multi-dongle support
+ * This allows any bonded central to connect, not just one specific central
+ */
+static int start_advertising(bool slow) {
+    int bond_count = 0;
+    bt_foreach_bond(BT_ID_DEFAULT, count_bonds, &bond_count);
+    is_bonded = (bond_count > 0);
 
-    bt_foreach_bond(BT_ID_DEFAULT, each_bond, &central_addr);
+    uint16_t interval_min = slow ? ADV_SLOW_INTERVAL_MIN : ADV_FAST_INTERVAL_MIN;
+    uint16_t interval_max = slow ? ADV_SLOW_INTERVAL_MAX : ADV_FAST_INTERVAL_MAX;
 
-    if (bt_addr_le_cmp(&central_addr, BT_ADDR_LE_NONE) != 0) {
-        is_bonded = true;
-        struct bt_le_adv_param adv_param = low_duty ? *BT_LE_ADV_CONN_DIR_LOW_DUTY(&central_addr)
-                                                    : *BT_LE_ADV_CONN_DIR(&central_addr);
-        return bt_le_adv_start(&adv_param, NULL, 0, NULL, 0);
-    } else {
-        is_bonded = false;
-        return bt_le_adv_start(BT_LE_ADV_CONN, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
+    struct bt_le_adv_param adv_param = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_ONE_TIME,
+        interval_min, interval_max, NULL);
+
+    int err = bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
+
+    if (err == 0 && !slow) {
+        /* Schedule transition to slow advertising after fast period */
+        k_work_schedule(&slow_adv_work, K_SECONDS(ADV_FAST_DURATION_SEC));
     }
-};
 
-static bool low_duty_advertising = false;
+    return err;
+}
+
 static bool enabled = false;
 
 static void advertising_cb(struct k_work *work) {
-    const int err = start_advertising(low_duty_advertising);
+    const int err = start_advertising(slow_advertising);
     if (err < 0) {
         LOG_ERR("Failed to start advertising (%d)", err);
     }
@@ -84,15 +104,24 @@ static void advertising_cb(struct k_work *work) {
 
 K_WORK_DEFINE(advertising_work, advertising_cb);
 
+static void switch_to_slow_adv_cb(struct k_work *work) {
+    if (!is_connected && enabled) {
+        bt_le_adv_stop();
+        slow_advertising = true;
+        k_work_submit(&advertising_work);
+        LOG_DBG("Switched to slow advertising (200ms interval)");
+    }
+}
+
 static void connected(struct bt_conn *conn, uint8_t err) {
     is_connected = (err == 0);
 
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
 
-    if (err == BT_HCI_ERR_ADV_TIMEOUT && enabled) {
-        low_duty_advertising = true;
-        k_work_submit(&advertising_work);
+    if (is_connected) {
+        /* Cancel slow advertising transition if connected */
+        k_work_cancel_delayable(&slow_adv_work);
     }
 }
 
@@ -109,7 +138,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
 
     if (enabled) {
-        low_duty_advertising = false;
+        /* Reset to fast advertising on reconnection attempt */
+        slow_advertising = false;
         k_work_submit(&advertising_work);
     }
 }
@@ -240,7 +270,7 @@ static int zmk_peripheral_ble_complete_startup(void) {
     bt_conn_cb_register(&conn_callbacks);
     bt_conn_auth_info_cb_register(&zmk_peripheral_ble_auth_info_cb);
 
-    low_duty_advertising = false;
+    slow_advertising = false;
 
     settings_loaded = true;
     k_work_submit(&notify_status_work);

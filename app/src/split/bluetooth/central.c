@@ -19,6 +19,10 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#define BT_LE_SCAN_PASSIVE_CONTINUOUS \
+    BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_PASSIVE, BT_LE_SCAN_OPT_FILTER_DUPLICATE, \
+                     BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_INTERVAL)
+
 #include <zmk/stdlib.h>
 #include <zmk/ble.h>
 #include <zmk/behavior.h>
@@ -909,7 +913,7 @@ static int start_scanning(void) {
 
     // Start scanning otherwise.
     is_scanning = true;
-    int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
+    int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE_CONTINUOUS, split_central_device_found);
     if (err < 0) {
         LOG_ERR("Scanning failed to start (err %d)", err);
         return err;
