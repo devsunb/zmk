@@ -78,6 +78,22 @@ endif # ZMK_SPLIT_ROLE_CENTRAL
 
 if !ZMK_SPLIT_ROLE_CENTRAL
 
+config ZMK_SPLIT_BLE_MULTI_DONGLE
+    bool "Multi-dongle support"
+    select ZMK_PM_SOFT_OFF
+    help
+      Enables support for using the same peripheral with multiple centrals
+      (dongles) without re-pairing. Uses undirected advertising and enters
+      sleep mode if no connection is established within timeout period.
+
+config ZMK_SPLIT_BLE_MULTI_DONGLE_ADV_TIMEOUT
+    int "Advertising timeout before sleep (seconds)"
+    default 10
+    depends on ZMK_SPLIT_BLE_MULTI_DONGLE
+    help
+      Time in seconds to advertise before entering sleep mode if no
+      central connects. Device wakes on key press.
+
 config ZMK_SPLIT_BLE_PERIPHERAL_STACK_SIZE
     int "BLE split peripheral notify thread stack size"
     default 756

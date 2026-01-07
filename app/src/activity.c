@@ -79,6 +79,9 @@ void activity_work_handler(struct k_work *work) {
         // Put devices in suspend power mode before sleeping
         set_state(ZMK_ACTIVITY_SLEEP);
 
+#if IS_ENABLED(CONFIG_ZMK_PM_SOFT_OFF)
+        zmk_pm_soft_off();
+#else
         if (zmk_pm_suspend_devices() < 0) {
             LOG_ERR("Failed to suspend all the devices");
             zmk_pm_resume_devices();
@@ -86,6 +89,7 @@ void activity_work_handler(struct k_work *work) {
         }
 
         sys_poweroff();
+#endif
     } else
 #endif /* IS_ENABLED(CONFIG_ZMK_SLEEP) */
         if (inactive_time > MAX_IDLE_MS) {
