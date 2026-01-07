@@ -19,6 +19,9 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci_types.h>
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_MULTI_DONGLE)
+#include <zephyr/sys/poweroff.h>
+#endif
 
 #include "peripheral.h"
 #include "service.h"
@@ -33,6 +36,9 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_MULTI_DONGLE)
+#include <zmk/pm.h>
+#endif
 #include <zmk/event_manager.h>
 #include <zmk/events/split_peripheral_status_changed.h>
 #include <zmk/ble.h>
@@ -47,6 +53,79 @@ static const struct bt_data zmk_ble_ad[] = {
 static bool is_connected = false;
 
 static bool is_bonded = false;
+
+static bool enabled = false;
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_MULTI_DONGLE)
+
+#define ADV_INTERVAL_MIN 0x0020
+#define ADV_INTERVAL_MAX 0x0020
+
+static void advertising_cb(struct k_work *work);
+static void sleep_timeout_cb(struct k_work *work);
+K_WORK_DEFINE(advertising_work, advertising_cb);
+K_WORK_DELAYABLE_DEFINE(sleep_work, sleep_timeout_cb);
+
+static void each_bond(const struct bt_bond_info *info, void *user_data) {
+    bool *has_bond = (bool *)user_data;
+    if (bt_addr_le_cmp(&info->addr, BT_ADDR_LE_NONE) != 0) {
+        *has_bond = true;
+    }
+}
+
+static int start_advertising(void) {
+    bool has_bond = false;
+    bt_foreach_bond(BT_ID_DEFAULT, each_bond, &has_bond);
+    is_bonded = has_bond;
+
+    struct bt_le_adv_param adv_param = BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONN,
+        ADV_INTERVAL_MIN, ADV_INTERVAL_MAX, NULL);
+
+    int err = bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
+
+    if (err == 0) {
+        k_work_schedule(&sleep_work, K_SECONDS(CONFIG_ZMK_SPLIT_BLE_MULTI_DONGLE_ADV_TIMEOUT));
+    }
+
+    return err;
+}
+
+static void sleep_timeout_cb(struct k_work *work) {
+    if (!is_connected && enabled) {
+        LOG_INF("No connection, entering sleep mode");
+        bt_le_adv_stop();
+        zmk_pm_soft_off();
+    }
+}
+
+static void advertising_cb(struct k_work *work) {
+    const int err = start_advertising();
+    if (err < 0) {
+        LOG_ERR("Failed to start advertising (%d)", err);
+    }
+}
+
+static void connected(struct bt_conn *conn, uint8_t err) {
+    is_connected = (err == 0);
+
+    raise_zmk_split_peripheral_status_changed(
+        (struct zmk_split_peripheral_status_changed){.connected = is_connected});
+
+    if (is_connected) {
+        k_work_cancel_delayable(&sleep_work);
+    } else if (err == BT_HCI_ERR_ADV_TIMEOUT && enabled) {
+        k_work_submit(&advertising_work);
+    }
+}
+
+static void recycled(void) {
+    if (enabled) {
+        k_work_submit(&advertising_work);
+    }
+}
+
+#else /* !CONFIG_ZMK_SPLIT_BLE_MULTI_DONGLE */
 
 static void each_bond(const struct bt_bond_info *info, void *user_data) {
     bt_addr_le_t *addr = (bt_addr_le_t *)user_data;
@@ -70,10 +149,9 @@ static int start_advertising(bool low_duty) {
         is_bonded = false;
         return bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);
     }
-};
+}
 
 static bool low_duty_advertising = false;
-static bool enabled = false;
 
 static void advertising_cb(struct k_work *work) {
     const int err = start_advertising(low_duty_advertising);
@@ -102,6 +180,8 @@ static void recycled(void) {
         k_work_submit(&advertising_work);
     }
 }
+
+#endif /* CONFIG_ZMK_SPLIT_BLE_MULTI_DONGLE */
 
 static void disconnected(struct bt_conn *conn, uint8_t reason) {
     char addr[BT_ADDR_LE_STR_LEN];
@@ -242,8 +322,6 @@ static int zmk_peripheral_ble_complete_startup(void) {
 #else
     bt_conn_cb_register(&conn_callbacks);
     bt_conn_auth_info_cb_register(&zmk_peripheral_ble_auth_info_cb);
-
-    low_duty_advertising = false;
 
     settings_loaded = true;
     k_work_submit(&notify_status_work);
