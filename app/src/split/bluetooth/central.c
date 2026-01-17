@@ -35,6 +35,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/physical_layouts.h>
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
 #include <zmk/usb.h>
+#include <zmk/events/usb_conn_state_changed.h>
 #endif
 
 static int start_scanning(void);
@@ -138,6 +139,18 @@ static bool is_enabled;
 static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
+
+/*
+ * GATT discovery serialization to prevent concurrent discovery failures.
+ * Running multiple GATT discoveries simultaneously can cause the BLE stack
+ * to prematurely terminate subsequent discoveries.
+ */
+static struct bt_conn *discovering_conn = NULL;
+static struct bt_conn *pending_conn_queue[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static int pending_conn_count = 0;
+
+static void process_pending_discovery(struct k_work *work);
+static K_WORK_DEFINE(pending_discovery_work, process_pending_discovery);
 
 static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
 
@@ -538,22 +551,30 @@ static void update_peripherals_selected_physical_layout(struct k_work *_work) {
 K_WORK_DEFINE(update_peripherals_selected_layouts_work,
               update_peripherals_selected_physical_layout);
 
+static void discovery_complete(struct bt_conn *conn) {
+    discovering_conn = NULL;
+    k_work_submit(&pending_discovery_work);
+}
+
 static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                                                  const struct bt_gatt_attr *attr,
                                                  struct bt_gatt_discover_params *params) {
     if (!attr) {
         LOG_DBG("Discover complete");
+        discovery_complete(conn);
         return BT_GATT_ITER_STOP;
     }
 
     if (!attr->user_data) {
         LOG_ERR("Required user data not passed to discovery");
+        discovery_complete(conn);
         return BT_GATT_ITER_STOP;
     }
 
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
     if (slot == NULL) {
         LOG_ERR("No peripheral state found for connection");
+        discovery_complete(conn);
         return BT_GATT_ITER_STOP;
     }
 
@@ -710,7 +731,11 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
     }
 #endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
-    return subscribed ? BT_GATT_ITER_STOP : BT_GATT_ITER_CONTINUE;
+    if (subscribed) {
+        discovery_complete(conn);
+        return BT_GATT_ITER_STOP;
+    }
+    return BT_GATT_ITER_CONTINUE;
 }
 
 static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
@@ -719,6 +744,7 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
     if (!attr) {
         LOG_DBG("Discover complete");
         (void)memset(params, 0, sizeof(*params));
+        discovery_complete(conn);
         return BT_GATT_ITER_STOP;
     }
 
@@ -727,6 +753,7 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
     if (slot == NULL) {
         LOG_ERR("No peripheral state found for connection");
+        discovery_complete(conn);
         return BT_GATT_ITER_STOP;
     }
 
@@ -744,13 +771,62 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
     int err = bt_gatt_discover(conn, &slot->discover_params);
     if (err) {
         LOG_ERR("Failed to start discovering split service characteristics (err %d)", err);
+        discovery_complete(conn);
     }
     return BT_GATT_ITER_STOP;
 }
 
-static void split_central_process_connection(struct bt_conn *conn) {
+static void start_discovery_for_conn(struct bt_conn *conn) {
     int err;
 
+    struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+    if (slot == NULL) {
+        LOG_ERR("No peripheral state found for connection");
+        return;
+    }
+
+    if (slot->subscribe_params.value_handle) {
+        LOG_DBG("Already discovered, skipping");
+        // Note: discovery_complete() is not called here because discovering_conn
+        // was never set for this connection - caller checks this before queueing.
+        return;
+    }
+
+    LOG_DBG("Starting GATT discovery for connection");
+    discovering_conn = conn;
+
+    slot->discover_params.uuid = &split_service_uuid.uuid;
+    slot->discover_params.func = split_central_service_discovery_func;
+    slot->discover_params.start_handle = 0x0001;
+    slot->discover_params.end_handle = 0xffff;
+    slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+    err = bt_gatt_discover(slot->conn, &slot->discover_params);
+    if (err) {
+        LOG_ERR("Discover failed(err %d)", err);
+        discovering_conn = NULL;
+        k_work_submit(&pending_discovery_work);
+        return;
+    }
+}
+
+static void process_pending_discovery(struct k_work *work) {
+    if (discovering_conn != NULL || pending_conn_count == 0) {
+        return;
+    }
+
+    struct bt_conn *conn = pending_conn_queue[0];
+    for (int i = 0; i < pending_conn_count - 1; i++) {
+        pending_conn_queue[i] = pending_conn_queue[i + 1];
+    }
+    pending_conn_count--;
+
+    LOG_DBG("Starting queued discovery, %d remaining", pending_conn_count);
+    start_discovery_for_conn(conn);
+    bt_conn_unref(conn);
+}
+
+static void split_central_process_connection(struct bt_conn *conn) {
     LOG_DBG("Current security for connection: %d", bt_conn_get_security(conn));
 
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
@@ -760,16 +836,15 @@ static void split_central_process_connection(struct bt_conn *conn) {
     }
 
     if (!slot->subscribe_params.value_handle) {
-        slot->discover_params.uuid = &split_service_uuid.uuid;
-        slot->discover_params.func = split_central_service_discovery_func;
-        slot->discover_params.start_handle = 0x0001;
-        slot->discover_params.end_handle = 0xffff;
-        slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-        err = bt_gatt_discover(slot->conn, &slot->discover_params);
-        if (err) {
-            LOG_ERR("Discover failed(err %d)", err);
-            return;
+        if (discovering_conn != NULL) {
+            if (pending_conn_count < ZMK_SPLIT_BLE_PERIPHERAL_COUNT) {
+                LOG_DBG("Discovery in progress, queueing connection");
+                pending_conn_queue[pending_conn_count++] = bt_conn_ref(conn);
+            } else {
+                LOG_ERR("Pending discovery queue full");
+            }
+        } else {
+            start_discovery_for_conn(conn);
         }
     }
 
@@ -813,6 +888,7 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     // Stop scanning so we can connect to the peripheral device.
     int err = stop_scanning();
     if (err < 0) {
+        release_peripheral_slot(slot_idx);
         return false;
     }
 
@@ -824,8 +900,9 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     if (err < 0) {
         LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err, BT_HCI_OP_LE_CREATE_CONN);
         release_peripheral_slot(slot_idx);
-        start_scanning();
     }
+
+    start_scanning();
 
     return false;
 }
@@ -911,7 +988,6 @@ static int start_scanning(void) {
     }
 
     // Start scanning otherwise.
-    is_scanning = true;
 #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
     const struct bt_le_scan_param *scan_param =
         zmk_usb_is_powered() ? BT_LE_SCAN_PASSIVE_CONTINUOUS : BT_LE_SCAN_PASSIVE;
@@ -923,6 +999,7 @@ static int start_scanning(void) {
         LOG_ERR("Scanning failed to start (err %d)", err);
         return err;
     }
+    is_scanning = true;
 
     LOG_DBG("Scanning successfully started");
     return 0;
@@ -964,6 +1041,22 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_DBG("Disconnected: %s (reason %d)", addr, reason);
+
+    if (discovering_conn == conn) {
+        discovering_conn = NULL;
+        k_work_submit(&pending_discovery_work);
+    }
+
+    for (int i = 0; i < pending_conn_count; i++) {
+        if (pending_conn_queue[i] == conn) {
+            bt_conn_unref(conn);
+            for (int j = i; j < pending_conn_count - 1; j++) {
+                pending_conn_queue[j] = pending_conn_queue[j + 1];
+            }
+            pending_conn_count--;
+            break;
+        }
+    }
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct peripheral_event_wrapper ev = {
@@ -1170,11 +1263,20 @@ static int zmk_split_bt_central_listener_cb(const zmk_event_t *eh) {
     if (as_zmk_physical_layout_selection_changed(eh)) {
         k_work_submit(&update_peripherals_selected_layouts_work);
     }
+#if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
+    if (as_zmk_usb_conn_state_changed(eh) && is_scanning) {
+        stop_scanning();
+        start_scanning();
+    }
+#endif
     return ZMK_EV_EVENT_BUBBLE;
 }
 
 ZMK_LISTENER(zmk_split_bt_central, zmk_split_bt_central_listener_cb);
 ZMK_SUBSCRIPTION(zmk_split_bt_central, zmk_physical_layout_selection_changed);
+#if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
+ZMK_SUBSCRIPTION(zmk_split_bt_central, zmk_usb_conn_state_changed);
+#endif
 
 static int split_central_bt_send_command(uint8_t source,
                                          struct zmk_split_transport_central_command cmd) {
