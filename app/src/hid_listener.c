@@ -36,6 +36,16 @@ static int hid_listener_keycode_pressed(const struct zmk_keycode_state_changed *
 
     LOG_DBG("usage_page 0x%02X keycode 0x%02X implicit_mods 0x%02X explicit_mods 0x%02X",
             ev->usage_page, ev->keycode, ev->implicit_modifiers, ev->explicit_modifiers);
+
+    zmk_mod_flags_t current_implicit = zmk_hid_get_implicit_mods();
+    if (current_implicit != 0 && current_implicit != ev->implicit_modifiers) {
+        zmk_hid_implicit_modifiers_release();
+        err = zmk_endpoint_send_report(HID_USAGE_KEY);
+        if (err < 0) {
+            LOG_ERR("Failed to send report for implicit modifier release (%d)", err);
+        }
+    }
+
     err = zmk_hid_press(ZMK_HID_USAGE(ev->usage_page, ev->keycode));
     if (err < 0) {
         LOG_DBG("Unable to press keycode");
